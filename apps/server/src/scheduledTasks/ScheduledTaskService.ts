@@ -4,6 +4,8 @@ import {
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   type ProjectId,
   ScheduledTask,
+  ScheduledTaskCheck,
+  ScheduledTaskCheckResult,
   ScheduledTaskError,
   ScheduledTaskId,
   ThreadId,
@@ -34,6 +36,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as Exit from "effect/Exit";
+import * as FiberSet from "effect/FiberSet";
 import * as Duration from "effect/Duration";
 import * as Metric from "effect/Metric";
 import * as Layer from "effect/Layer";
@@ -54,6 +57,7 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ManagedPolicy from "../policy/ManagedPolicy.ts";
 import * as DueHint from "../scheduling/DueHint.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
+import * as ScheduledTaskCheckRunner from "./ScheduledTaskCheckRunner.ts";
 import { isMissedFixedTimeRun, isSameSchedule, nextScheduledRunAt } from "./Schedule.ts";
 import {
   redactHeaders,
@@ -182,6 +186,12 @@ const decodeWorkspaceStrategyJson = Schema.decodeUnknownEffect(
 const decodeModelSelectionJson = Schema.decodeUnknownEffect(
   Schema.fromJsonString(ScheduledTask.fields.modelSelection),
 );
+const CheckJson = Schema.fromJsonString(ScheduledTaskCheck);
+const CheckResultJson = Schema.fromJsonString(ScheduledTaskCheckResult);
+const decodeCheckJson = Schema.decodeUnknownEffect(CheckJson);
+const decodeCheckResultJson = Schema.decodeUnknownEffect(CheckResultJson);
+const encodeCheckJson = Schema.encodeSync(CheckJson);
+const encodeCheckResultJson = Schema.encodeSync(CheckResultJson);
 const HeadersJson = Schema.fromJsonString(Schema.Record(Schema.String, Schema.String));
 const MissingFieldsJson = Schema.fromJsonString(Schema.Array(Schema.String));
 const decodeHeadersJson = Schema.decodeUnknownOption(HeadersJson);
@@ -212,6 +222,8 @@ interface ScheduledTaskRow {
   readonly run_count: number;
   readonly webhook_token: string | null;
   readonly webhook_secret: string | null;
+  readonly check_json: string | null;
+  readonly last_check_json: string | null;
 }
 
 interface WebhookDeliveryRow {
@@ -338,6 +350,17 @@ function errorMessage(error: unknown): string {
   return failure instanceof Error ? failure.message : String(failure);
 }
 
+function withCheckOutput(prompt: string, result: ScheduledTaskCheckResult): string {
+  if (result.output.length === 0) return prompt;
+  const longestTicks = Math.max(0, ...(result.output.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(Math.max(3, longestTicks + 1));
+  const heading = `\n\nCheck output (exit ${result.exitCode}):\n${fence}\n`;
+  const room =
+    PROVIDER_SEND_TURN_MAX_INPUT_CHARS - prompt.length - heading.length - fence.length - 1;
+  if (room <= 0) return prompt;
+  return `${prompt}${heading}${result.output.slice(0, room)}\n${fence}`;
+}
+
 function webhookPath(taskId: string, token: string): string {
   return `${WEBHOOK_ROUTE_PREFIX}/${encodeURIComponent(taskId)}/${token}`;
 }
@@ -362,6 +385,9 @@ const decodeRow = Effect.fnUntraced(
     const webhook = schedule.type === "webhook" ? webhookEndpoint(row, origin) : undefined;
     const workspaceStrategy = yield* decodeWorkspaceStrategyJson(row.workspace_strategy_json);
     const modelSelection = yield* decodeModelSelectionJson(row.model_selection_json);
+    const check = row.check_json === null ? null : yield* decodeCheckJson(row.check_json);
+    const lastCheck =
+      row.last_check_json === null ? null : yield* decodeCheckResultJson(row.last_check_json);
     return yield* decodeTask({
       id: row.task_id,
       title: row.title,
@@ -384,6 +410,8 @@ const decodeRow = Effect.fnUntraced(
       lastRunError: row.last_run_error,
       runCount: row.run_count,
       ...(webhook === undefined ? {} : { webhook }),
+      ...(check === null ? {} : { check }),
+      ...(lastCheck === null ? {} : { lastCheck }),
     });
   },
   (effect, row, _origin?) =>
@@ -443,6 +471,10 @@ export const layer = Layer.effect(
     const scheduler = yield* Scheduler.Scheduler;
     const readWebhookOrigin = yield* ScheduledTaskWebhookOrigin;
     const managedPolicy = yield* ManagedPolicy.ManagedPolicy;
+    const checkRunner = yield* ScheduledTaskCheckRunner.ScheduledTaskCheckRunner;
+    // Checks can take minutes, so their runs leave the one-at-a-time sweep; activeRuns
+    // keeps a later sweep from starting the same task again.
+    const checkedRuns = yield* FiberSet.make();
     const webhookPolicyOrganization = ManagedPolicy.deniedBy(managedPolicy, "webhookTasks");
     // Existing webhook tasks stay stored but report why they do not run.
     const webhookPolicyBlock =
@@ -504,7 +536,9 @@ export const layer = Layer.effect(
         last_run_error,
         run_count,
         webhook_token,
-        webhook_secret
+        webhook_secret,
+        check_json,
+        last_check_json
       FROM scheduled_tasks
       -- Not updated_at: toggles, runs and edits rewrite it, and clients render
       -- this order as-is, so rows would move under the pointer.
@@ -545,7 +579,9 @@ export const layer = Layer.effect(
         last_run_error,
         run_count,
         webhook_token,
-        webhook_secret
+        webhook_secret,
+        check_json,
+        last_check_json
       FROM scheduled_tasks
       WHERE task_id = ${id}
     `.pipe(NodeSqliteClient.readOnly);
@@ -622,7 +658,8 @@ export const layer = Layer.effect(
           last_run_error,
           run_count,
           webhook_token,
-          webhook_secret
+          webhook_secret,
+          check_json
         )
         SELECT
           ${task.id},
@@ -646,7 +683,8 @@ export const layer = Layer.effect(
           ${task.lastRunError},
           ${task.runCount},
           ${webhook.token},
-          ${webhook.secret}
+          ${webhook.secret},
+          ${task.check === undefined ? null : encodeCheckJson(task.check)}
         WHERE ${requireExisting ? 0 : 1} = 1
            OR EXISTS (SELECT 1 FROM scheduled_tasks WHERE task_id = ${task.id})
         ON CONFLICT (task_id)
@@ -663,6 +701,11 @@ export const layer = Layer.effect(
           interaction_mode = excluded.interaction_mode,
           creation_source = excluded.creation_source,
           updated_at = excluded.updated_at,
+          check_json = excluded.check_json,
+          last_check_json = CASE
+            WHEN excluded.check_json IS NULL THEN NULL
+            ELSE scheduled_tasks.last_check_json
+          END,
           -- Keep a next_run_at that a finishing run moved during this save, unless
           -- another edit changed the schedule or enabled state meanwhile.
           next_run_at = CASE
@@ -794,6 +837,61 @@ export const layer = Layer.effect(
         ),
     );
 
+    const recordCheck = (
+      task: ScheduledTask,
+      result: ScheduledTaskCheckResult,
+      nextRunAtIso: string | null | undefined,
+    ) =>
+      sql`
+        UPDATE scheduled_tasks
+        SET last_check_json = ${encodeCheckResultJson(result)},
+            updated_at = ${result.checkedAt},
+            next_run_at = CASE
+              WHEN ${nextRunAtIso === undefined ? 0 : 1} = 1 THEN ${nextRunAtIso ?? null}
+              ELSE next_run_at
+            END
+        WHERE task_id = ${task.id} AND created_at = ${task.createdAt}
+      `.pipe(
+        Effect.andThen(notifyChanged),
+        Effect.mapError((cause) =>
+          taskError("Could not record schedule task check.", { taskId: task.id, cause }),
+        ),
+      );
+
+    const runCheck = Effect.fn("ScheduledTaskService.runCheck")(function* (
+      task: ScheduledTask,
+      check: ScheduledTaskCheck,
+      trigger: "scheduled" | "manual",
+    ) {
+      const outcome = yield* checkRunner.run({ projectId: task.projectId, check });
+      const rule =
+        outcome.exitCode === null
+          ? undefined
+          : check.rules.find((candidate) => candidate.exitCode === outcome.exitCode);
+      const checkedAt = yield* localNow;
+      const result: ScheduledTaskCheckResult = {
+        checkedAt: iso(checkedAt),
+        exitCode: outcome.exitCode,
+        output: outcome.output,
+        ran: rule !== undefined,
+        error: outcome.error,
+      };
+      if (rule !== undefined) {
+        yield* recordCheck(task, result, undefined);
+        return { prompt: withCheckOutput(rule.prompt ?? task.prompt, result) } as const;
+      }
+      const next = trigger === "scheduled" ? nextRunAt(task, checkedAt) : undefined;
+      yield* recordCheck(task, result, next);
+      return {
+        skipped: {
+          ...task,
+          lastCheck: result,
+          updatedAt: result.checkedAt,
+          nextRunAt: next === undefined ? task.nextRunAt : next,
+        },
+      } as const;
+    });
+
     const runTask = Effect.fn("ScheduledTaskService.runTask")(function* (
       task: ScheduledTask,
       trigger: "scheduled" | "manual" | "webhook",
@@ -856,6 +954,14 @@ export const layer = Layer.effect(
           if (reason !== null) return yield* new WebhookDeliverySkipped({ reason });
         }
 
+        const checked =
+          webhook === undefined && active.check !== undefined && trigger !== "webhook"
+            ? yield* runCheck(active, active.check, trigger)
+            : undefined;
+        if (checked !== undefined && "skipped" in checked) {
+          return { task: checked.skipped, threadId: null, dispatchFailed: false };
+        }
+
         if (webhook === undefined) yield* markRunning(active.id, startedAtIso);
         else
           yield* sql
@@ -880,7 +986,7 @@ export const layer = Layer.effect(
             : `${active.id}:webhook:${webhook.deliveryId}`;
         const commandId = CommandId.make(`scheduled-task:${fireKey}`);
         const messageId = MessageId.make(`scheduled-task-message:${fireKey}`);
-        const prompt = webhook?.prompt ?? active.prompt;
+        const prompt = checked?.prompt ?? webhook?.prompt ?? active.prompt;
 
         // A bound thread can move to another project (No project to a project) while
         // this fires. Follow it; one move needs at most two retries. Same ids replay safely.
@@ -1108,16 +1214,19 @@ export const layer = Layer.effect(
       );
       yield* Effect.forEach(
         due,
-        ({ task, dueAt }) =>
-          Effect.suspend(() =>
-            isMissedFixedTimeRun(task.schedule, dueAt, now)
-              ? rescheduleMissedRun(task, now)
-              : runTask(task, "scheduled"),
+        ({ task, dueAt }) => {
+          const missed = isMissedFixedTimeRun(task.schedule, dueAt, now);
+          const run = Effect.suspend(() =>
+            missed ? rescheduleMissedRun(task, now) : runTask(task, "scheduled"),
           ).pipe(
             Effect.catch((cause) =>
               Effect.logWarning("Scheduled task run failed", { taskId: task.id, cause }),
             ),
-          ),
+          );
+          return task.check === undefined || missed
+            ? run
+            : FiberSet.run(checkedRuns, run).pipe(Effect.asVoid);
+        },
         { concurrency: 1, discard: true },
       );
     });
@@ -1316,6 +1425,14 @@ export const layer = Layer.effect(
         isSameSchedule(existingTask.schedule, schedule);
       if (!scheduleUnchanged)
         yield* requireFutureOnce({ enabled: input.enabled, schedule }, now, id);
+      // Omitted keeps the stored check, so a client that predates checks can re-save the task.
+      const check = input.check === undefined ? existingTask?.check : (input.check ?? undefined);
+      if (check !== undefined && schedule.type === "webhook") {
+        return yield* taskError(
+          "Webhook tasks can't have a check. Use webhook filters to choose which requests run.",
+          { taskId: id },
+        );
+      }
       const task: ScheduledTask = {
         id,
         title: input.title,
@@ -1339,6 +1456,7 @@ export const layer = Layer.effect(
         lastRunStatus: existingTask?.lastRunStatus ?? "never",
         lastRunError: existingTask?.lastRunError ?? null,
         runCount: existingTask?.runCount ?? 0,
+        ...(check === undefined ? {} : { check }),
       };
       yield* saveTask(
         task,

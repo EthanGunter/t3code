@@ -6,6 +6,7 @@ import {
   AuthSettingsWriteScope,
   DEFAULT_SERVER_SETTINGS,
   ProviderDriverKind,
+  ProjectId,
   ProviderInstanceId,
   SecretProviderId,
   ThreadId,
@@ -18,6 +19,7 @@ import {
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -262,6 +264,62 @@ it.effect("requires task permission before attaching a prepared worktree to a th
       }).pipe(Effect.flip),
     ).toMatchObject({ requiredPermission: AuthOrchestrationOperateScope });
     expect(handled).toBe(false);
+  }).pipe(Effect.scoped),
+);
+
+it.effect("requires terminal permission to save a scheduled task that runs a check command", () =>
+  Effect.gen(function* () {
+    const group = WsRpcGroup.omit(
+      ...[...WsRpcGroup.requests.keys()].filter(
+        (
+          tag,
+        ): tag is Exclude<
+          keyof typeof RPC_REQUIRED_SCOPES,
+          typeof WS_METHODS.scheduledTasksUpsert
+        > => tag !== WS_METHODS.scheduledTasksUpsert,
+      ),
+    );
+    let handled = 0;
+    const reached = yield* Deferred.make<void>();
+    const client = yield* RpcTest.makeClient(group).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          group.toLayerHandler(WS_METHODS.scheduledTasksUpsert, () =>
+            Effect.sync(() => {
+              handled += 1;
+            }).pipe(
+              Effect.andThen(Deferred.succeed(reached, undefined)),
+              Effect.andThen(Effect.never),
+            ),
+          ),
+          RpcAuthorization.layer([AuthOrchestrationOperateScope]),
+        ),
+      ),
+    );
+    const input = {
+      title: "Glass worker",
+      prompt: "Do the work",
+      enabled: true,
+      schedule: { type: "interval", everyMs: 60_000 },
+      projectId: ProjectId.make("project"),
+      workspaceStrategy: { type: "root" },
+      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+    } as const;
+    expect(
+      yield* client[WS_METHODS.scheduledTasksUpsert]({
+        ...input,
+        check: { command: "exit 0", rules: [{ exitCode: 0 }] },
+      }).pipe(Effect.flip),
+    ).toMatchObject({ requiredPermission: AuthTerminalOperateScope });
+    expect(handled).toBe(0);
+
+    yield* client[WS_METHODS.scheduledTasksUpsert]({ ...input, check: null }).pipe(
+      Effect.forkChild,
+    );
+    yield* Deferred.await(reached);
+    expect(handled).toBe(1);
   }).pipe(Effect.scoped),
 );
 

@@ -75,6 +75,9 @@ export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 
 const decodePrepareThread = Schema.decodeUnknownSync(GitPreparePullRequestThreadInput);
 const decodeStackedAction = Schema.decodeUnknownSync(GitRunStackedActionInput);
+const decodeScheduledTaskCheck = Schema.decodeUnknownSync(
+  Schema.Struct({ check: Schema.optional(Schema.Unknown) }),
+);
 
 export function clientRpcRequiredScopes(
   method: string,
@@ -92,6 +95,12 @@ export function clientRpcRequiredScopes(
       (payload.action === "create_pr" || payload.action === "commit_push_pr")
     )
       return [AuthSourceControlWriteScope, AuthOrchestrationReadScope];
+  }
+  // A check runs a shell command on the host, like a terminal.
+  if (method === WS_METHODS.scheduledTasksUpsert && input !== undefined) {
+    const { check } = decodeScheduledTaskCheck(input);
+    if (check !== undefined && check !== null)
+      return [AuthOrchestrationOperateScope, AuthTerminalOperateScope];
   }
   return Object.hasOwn(CLIENT_GUARDED_RPC_SCOPES, method)
     ? [CLIENT_GUARDED_RPC_SCOPES[method as ClientGuardedRpcTag]]

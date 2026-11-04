@@ -2681,6 +2681,35 @@ describe("OrchestratorMcpService provider resolution", () => {
       }),
     );
 
+    it.effect("lets only a full-access caller give a task a check command", () =>
+      Effect.gen(function* () {
+        const upserted = yield* Ref.make(0);
+        const unbound = task({ schedule: { type: "interval", everyMs: 60_000 } });
+        const mcp = yield* OrchestratorMcpService.OrchestratorMcpService.pipe(
+          Effect.provide(service([unbound], null, upserted)),
+        );
+        const check = { command: "exit 0", rules: [{ exitCode: 0 }] };
+        const error = yield* mcp
+          .updateScheduledTask(supervisedClient, { scheduledTaskId: unbound.id, check })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "invalid_request");
+        assert.equal(yield* Ref.get(upserted), 0);
+
+        yield* mcp.updateScheduledTask(supervisedClient, {
+          scheduledTaskId: unbound.id,
+          check: null,
+        });
+        yield* mcp.updateScheduledTask(
+          {
+            ...supervisedClient,
+            client: { sessionId: "scheduled", label: "Claude Code", access: "full-access" },
+          },
+          { scheduledTaskId: unbound.id, check },
+        );
+        assert.equal(yield* Ref.get(upserted), 2);
+      }),
+    );
+
     it.effect("reports a saved task even when its bound thread cannot be read", () =>
       Effect.gen(function* () {
         const upserted = yield* Ref.make(0);

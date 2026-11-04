@@ -214,6 +214,50 @@ export const ScheduledTaskUpsertSchedule = Schema.Union([
 ]);
 export type ScheduledTaskUpsertSchedule = typeof ScheduledTaskUpsertSchedule.Type;
 
+const MAX_SCHEDULED_TASK_CHECK_RULES = 16;
+export const DEFAULT_SCHEDULED_TASK_CHECK_TIMEOUT_SECONDS = 60;
+const MAX_SCHEDULED_TASK_CHECK_TIMEOUT_SECONDS = 600;
+
+export const ScheduledTaskCheckRule = Schema.Struct({
+  exitCode: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 255 })),
+  prompt: Schema.optional(TrimmedNonEmptyString).annotate({
+    description: "Default: the task's prompt.",
+  }),
+});
+export type ScheduledTaskCheckRule = typeof ScheduledTaskCheckRule.Type;
+
+export const ScheduledTaskCheck = Schema.Struct({
+  command: TrimmedNonEmptyString.check(Schema.isMaxLength(8_000)),
+  timeoutSeconds: Schema.optional(
+    Schema.Int.check(
+      Schema.isBetween({ minimum: 1, maximum: MAX_SCHEDULED_TASK_CHECK_TIMEOUT_SECONDS }),
+    ),
+  ).annotate({ description: "Default 60." }),
+  rules: Schema.Array(ScheduledTaskCheckRule).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(MAX_SCHEDULED_TASK_CHECK_RULES),
+    Schema.makeFilter((rules) =>
+      new Set(rules.map((rule) => rule.exitCode)).size === rules.length
+        ? true
+        : "Each exit code can have only one rule.",
+    ),
+  ),
+}).annotate({
+  description:
+    "Shell command run in the project folder before each timed run. The rule for its exit code runs with that prompt plus the command's output; any other exit code skips the run. Not for webhook tasks.",
+});
+export type ScheduledTaskCheck = typeof ScheduledTaskCheck.Type;
+
+export const ScheduledTaskCheckResult = Schema.Struct({
+  checkedAt: IsoDateTime,
+  /** Null when the command timed out or could not start. */
+  exitCode: Schema.NullOr(Schema.Int),
+  output: Schema.String,
+  ran: Schema.Boolean,
+  error: Schema.NullOr(Schema.String),
+});
+export type ScheduledTaskCheckResult = typeof ScheduledTaskCheckResult.Type;
+
 export const ScheduledTaskRunStatus = Schema.Literals(["never", "running", "succeeded", "failed"]);
 export type ScheduledTaskRunStatus = typeof ScheduledTaskRunStatus.Type;
 
@@ -246,6 +290,8 @@ export const ScheduledTask = Schema.Struct({
   lastRunError: Schema.NullOr(Schema.String),
   runCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   webhook: Schema.optional(ScheduledTaskWebhookEndpoint),
+  check: Schema.optionalKey(ScheduledTaskCheck),
+  lastCheck: Schema.optionalKey(ScheduledTaskCheckResult),
   /** Why the task cannot run regardless of `enabled`, such as a managed policy refusing webhooks. */
   blockedByPolicy: Schema.optionalKey(Schema.String),
 });
@@ -275,6 +321,9 @@ export const ScheduledTaskUpsertInput = Schema.Struct({
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: ProviderInteractionMode,
+  check: Schema.optional(Schema.NullOr(ScheduledTaskCheck)).annotate({
+    description: "Omitted: keep stored. Null clears.",
+  }),
   createdBy: Schema.optional(OrchestrationV2Actor),
   creationSource: Schema.optional(OrchestrationV2CreationSource),
 });

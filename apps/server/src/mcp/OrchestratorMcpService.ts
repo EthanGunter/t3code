@@ -269,6 +269,7 @@ function scheduledTaskSummary(task: ScheduledTask, mayRun: boolean): Orchestrato
     schedule: task.schedule,
     nextRunAt: task.nextRunAt,
     lastRunStatus: task.lastRunStatus,
+    ...(task.check === undefined ? {} : { check: task.check }),
     ...(task.webhook?.url == null || !mayRun || task.blockedByPolicy !== undefined
       ? {}
       : { webhookUrl: task.webhook.url }),
@@ -1950,6 +1951,20 @@ const make = Effect.gen(function* () {
     },
   );
 
+  // A check runs a shell command with no approval prompt, so only a full-access caller sets one.
+  const requireCheckAccess = (
+    check: ScheduledTaskUpsertInput["check"],
+    limits: { readonly runtimeMode: RuntimeMode },
+  ) =>
+    check === undefined || check === null || limits.runtimeMode === "full-access"
+      ? Effect.void
+      : Effect.fail(
+          failure(
+            "invalid_request",
+            "Only a thread running in full access can give a scheduled task a check command.",
+          ),
+        );
+
   /**
    * A scheduled task the caller may change: one whose runs execute at modes no
    * broader than the caller's own, so editing its prompt cannot run work above
@@ -1983,6 +1998,7 @@ const make = Effect.gen(function* () {
   return OrchestratorMcpService.of({
     scheduleTask: Effect.fn("OrchestratorMcpService.scheduleTask")(function* (scope, input) {
       const { parent, limits } = yield* loadCaller(scope);
+      yield* requireCheckAccess(input.check, limits);
       const projectId = yield* resolveProjectTarget(parent, input.projectId);
       yield* assertLiveCallerForOtherProject(scope, parent, projectId);
       const project = yield* requireProject(projectId);
@@ -2013,6 +2029,7 @@ const make = Effect.gen(function* () {
         modelSelection,
         runtimeMode: limits.runtimeMode,
         interactionMode: limits.interactionMode,
+        ...(input.check === undefined ? {} : { check: input.check }),
         createdBy: "agent",
         creationSource: "mcp",
         // Scope the idempotency key by provider session so two callers
@@ -2058,6 +2075,7 @@ const make = Effect.gen(function* () {
     updateScheduledTask: Effect.fn("OrchestratorMcpService.updateScheduledTask")(
       function* (scope, input) {
         const { parent, limits } = yield* loadCaller(scope);
+        yield* requireCheckAccess(input.check, limits);
         const existing = yield* loadScheduledTask(input.scheduledTaskId, limits);
         yield* assertLiveCallerForOtherProject(scope, parent, existing.projectId);
         if (
@@ -2094,6 +2112,7 @@ const make = Effect.gen(function* () {
           modelSelection: existing.modelSelection,
           runtimeMode: existing.runtimeMode,
           interactionMode: existing.interactionMode,
+          ...(input.check === undefined ? {} : { check: input.check }),
           createdBy: existing.createdBy,
           creationSource: existing.creationSource,
         };
