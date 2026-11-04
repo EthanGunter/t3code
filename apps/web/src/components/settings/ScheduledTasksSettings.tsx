@@ -18,6 +18,7 @@ import type {
   OrchestrationV2ThreadLaunchWorkspaceStrategy,
   ProjectId,
   ScheduledTask,
+  ScheduledTaskCheckResult,
   ScheduledTaskId,
   ScheduledTaskSchedule,
   ScheduledTaskUpsertInput,
@@ -33,6 +34,17 @@ import {
   type WebhookFilterDraft,
 } from "@t3tools/client-runtime/scheduled-task-webhook";
 import {
+  CHECK_TIMEOUT_PLACEHOLDER,
+  checkDraft,
+  checkDraftChanged,
+  checkResultLabel,
+  emptyCheckRuleDraft,
+  parseCheckDraft,
+  removeCheckRuleDraft,
+  type ScheduledTaskCheckDraft,
+} from "@t3tools/client-runtime/scheduled-task-check";
+import {
+  MAX_SCHEDULED_TASK_CHECK_RULES,
   MAX_WEBHOOK_DELIVERY_AGE_MINUTES,
   MAX_WEBHOOK_FILTERS,
   MIN_SCHEDULED_TASK_INTERVAL_MS,
@@ -71,13 +83,14 @@ import { EnvironmentMachineIcon } from "../EnvironmentMachineIcon";
 import { ConnectionStatusDot, connectionPhaseDotClassName } from "../ConnectionStatusDot";
 import {
   AuthOrchestrationOperateScope,
+  AuthTerminalOperateScope,
   clampManagedRuntimeMode,
   managedCapabilityDenial,
 } from "@t3tools/contracts";
 import { resolvePastedPath } from "@t3tools/shared/path";
 import { useManagedPolicy } from "~/state/managedPolicy";
 import { ManagedNotice } from "../ManagedPolicy";
-import { readEnvironmentScope } from "~/state/session";
+import { readEnvironmentScope, useEnvironmentScope } from "~/state/session";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { EnvironmentRow, useEnvironmentTransportLabel } from "./EnvironmentRow";
 import { SettingsGroup } from "./SettingsGroup";
@@ -166,7 +179,127 @@ const EMPTY_DRAFT: DraftState = {
   coalesceWindowSeconds: "",
   filters: [],
   savedFilters: [],
+  check: checkDraft(undefined),
+  savedCheck: checkDraft(undefined),
 };
+
+function CheckField({
+  check,
+  canSetCommands,
+  onChange,
+}: {
+  check: ScheduledTaskCheckDraft;
+  canSetCommands: boolean;
+  onChange: (check: ScheduledTaskCheckDraft) => void;
+}) {
+  const updateRule = (index: number, patch: { exitCode?: string; prompt?: string }) =>
+    onChange({
+      ...check,
+      rules: check.rules.map((rule, at) => (at === index ? { ...rule, ...patch } : rule)),
+    });
+  return (
+    <fieldset disabled={!canSetCommands} className="min-w-0 space-y-3">
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0 space-y-1">
+          <Label htmlFor="scheduled-task-check">Check first</Label>
+          <p id="scheduled-task-check-description" className="text-sm text-muted-foreground">
+            {canSetCommands
+              ? "Run a command in the project folder before each run. Its exit code picks the prompt, and its output is added to it. Any other exit code skips the run."
+              : "Changing the check needs terminal access to this environment."}
+          </p>
+        </div>
+        <Switch
+          id="scheduled-task-check"
+          aria-describedby="scheduled-task-check-description"
+          checked={check.enabled}
+          onCheckedChange={(enabled) => onChange({ ...check, enabled })}
+        />
+      </div>
+      {check.enabled ? (
+        <div className="space-y-3">
+          <Field label="Command" htmlFor="scheduled-task-check-command">
+            <Textarea
+              id="scheduled-task-check-command"
+              size="sm"
+              placeholder="./scripts/has-work.sh"
+              value={check.command}
+              onChange={(event) => onChange({ ...check, command: event.target.value })}
+            />
+          </Field>
+          <div className="flex items-center gap-2">
+            <Label htmlFor="scheduled-task-check-timeout">Time limit</Label>
+            <Input
+              type="number"
+              id="scheduled-task-check-timeout"
+              nativeInput
+              min={1}
+              className="w-24"
+              placeholder={CHECK_TIMEOUT_PLACEHOLDER}
+              value={check.timeoutSeconds}
+              onChange={(event) => onChange({ ...check, timeoutSeconds: event.target.value })}
+            />
+            <span className="text-xs text-muted-foreground">seconds</span>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 space-y-1">
+              <Label>Exit codes that run</Label>
+              <p className="text-sm text-muted-foreground">
+                Leave a prompt blank to use the task's prompt.
+              </p>
+            </div>
+            <Button
+              className="shrink-0"
+              variant="outline"
+              size="sm"
+              disabled={check.rules.length >= MAX_SCHEDULED_TASK_CHECK_RULES}
+              onClick={() =>
+                onChange({ ...check, rules: [...check.rules, emptyCheckRuleDraft(check.rules)] })
+              }
+            >
+              <PlusIcon />
+              Add exit code
+            </Button>
+          </div>
+          {check.rules.map((rule, index) => (
+            <div key={rule.id} className="flex items-start gap-2">
+              <div className="grid w-20 shrink-0 grid-cols-1">
+                <Input
+                  type="number"
+                  nativeInput
+                  min={0}
+                  max={255}
+                  aria-label={`Rule ${index + 1} exit code`}
+                  value={rule.exitCode}
+                  onChange={(event) => updateRule(index, { exitCode: event.target.value })}
+                />
+              </div>
+              <div className="grid min-w-0 flex-1 grid-cols-1">
+                <Textarea
+                  size="sm"
+                  aria-label={`Rule ${index + 1} prompt`}
+                  placeholder="The task's prompt"
+                  value={rule.prompt}
+                  onChange={(event) => updateRule(index, { prompt: event.target.value })}
+                />
+              </div>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Remove rule ${index + 1}`}
+                disabled={check.rules.length === 1}
+                onClick={() =>
+                  onChange({ ...check, rules: removeCheckRuleDraft(check.rules, rule.id) })
+                }
+              >
+                <Trash2Icon />
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </fieldset>
+  );
+}
 
 function WebhookFiltersField({
   filters,
@@ -716,6 +849,23 @@ function ScheduledTaskEnvironmentSection({
   );
 }
 
+function LastCheckLabel({ result }: { readonly result: ScheduledTaskCheckResult }) {
+  const label = (
+    <span className={result.error === null ? undefined : "text-destructive"}>
+      {checkResultLabel(result)} <ScheduledRelativeLabel value={result.checkedAt} />
+    </span>
+  );
+  if (!result.output) return label;
+  return (
+    <Tooltip>
+      <TooltipTrigger render={label} />
+      <TooltipPopup>
+        <div className="max-w-md whitespace-pre-wrap">{result.output.slice(-2_000)}</div>
+      </TooltipPopup>
+    </Tooltip>
+  );
+}
+
 function ScheduledTaskRow({
   environmentId,
   task,
@@ -786,6 +936,9 @@ function ScheduledTaskRow({
             <Badge variant={statusVariant(task.lastRunStatus)}>{task.lastRunStatus}</Badge>
           ) : null}
           {task.lastRunError ? <span className="text-destructive">{task.lastRunError}</span> : null}
+          {task.check !== undefined && task.lastCheck !== undefined ? (
+            <LastCheckLabel result={task.lastCheck} />
+          ) : null}
         </div>
       }
       control={
@@ -1213,6 +1366,7 @@ function ScheduledTaskEditorForm({
   const upsertTask = useAtomCommand(serverEnvironment.upsertScheduledTask, {
     label: "scheduled task upsert",
   });
+  const canSetCommands = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
   const webhookDenial = managedCapabilityDenial(useManagedPolicy(environmentId), "webhookTasks");
   const [draft, setDraft] = useState<DraftState>(() =>
     task
@@ -1304,6 +1458,19 @@ function ScheduledTaskEditorForm({
       for (const error of scheduleDraftErrors(draft)) reportFailure(error.title, error.description);
       return;
     }
+    // Webhook tasks can't keep a check, so switching to one clears it.
+    const parsedCheck =
+      schedule.type === "webhook"
+        ? draft.savedCheck.enabled
+          ? { check: null }
+          : null
+        : checkDraftChanged(draft.savedCheck, draft.check)
+          ? parseCheckDraft(draft.check)
+          : null;
+    if (parsedCheck !== null && "error" in parsedCheck) {
+      reportFailure("Invalid check", parsedCheck.error);
+      return;
+    }
     if (
       schedule.type === "webhook" &&
       schedule.signature &&
@@ -1363,6 +1530,7 @@ function ScheduledTaskEditorForm({
         clampManagedRuntimeMode(environment?.serverConfig?.managedPolicy, draft.runtimeMode) ??
         draft.runtimeMode,
       interactionMode: draft.interactionMode,
+      ...(parsedCheck === null ? {} : { check: parsedCheck.check }),
       creationSource: "web",
     };
     // Lock before React renders, and keep successful creates locked until the form closes.
@@ -1912,6 +2080,14 @@ function ScheduledTaskEditorForm({
               </div>
             )}
           </div>
+
+          {draft.scheduleMode === "webhook" ? null : (
+            <CheckField
+              check={draft.check}
+              canSetCommands={canSetCommands}
+              onChange={(check) => setDraft((current) => ({ ...current, check }))}
+            />
+          )}
 
           <div className="flex items-center justify-between gap-4">
             <div className="min-w-0 space-y-1">

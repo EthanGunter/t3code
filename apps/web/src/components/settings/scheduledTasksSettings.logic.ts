@@ -18,6 +18,10 @@ import {
   webhookFilterDraftsChanged,
   type WebhookFilterDraft,
 } from "@t3tools/client-runtime/scheduled-task-webhook";
+import {
+  checkDraft,
+  type ScheduledTaskCheckDraft,
+} from "@t3tools/client-runtime/scheduled-task-check";
 
 import {
   resolveProjectSettings,
@@ -92,6 +96,9 @@ export interface DraftState {
   readonly filters: ReadonlyArray<WebhookFilterDraft>;
   /** The filter rows the form opened with. */
   readonly savedFilters: ReadonlyArray<WebhookFilterDraft>;
+  readonly check: ScheduledTaskCheckDraft;
+  /** The check the form opened with. */
+  readonly savedCheck: ScheduledTaskCheckDraft;
 }
 
 export const WEBHOOK_SIGNATURE_DEFAULTS = {
@@ -236,6 +243,7 @@ export function scheduleFromDraft(draft: DraftState): ScheduledTaskUpsertSchedul
 export function taskToDraft(task: ScheduledTask): DraftState {
   const schedule = task.schedule;
   const filters = webhookFilterDrafts(schedule.type === "webhook" ? schedule.filters : undefined);
+  const check = checkDraft(task.check);
   const weekdays =
     schedule.type === "fixed_time" && schedule.weekdays && schedule.weekdays.length > 0
       ? new Set(schedule.weekdays)
@@ -289,6 +297,8 @@ export function taskToDraft(task: ScheduledTask): DraftState {
         : "",
     filters,
     savedFilters: filters,
+    check,
+    savedCheck: check,
   };
 }
 

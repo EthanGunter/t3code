@@ -214,9 +214,9 @@ export const ScheduledTaskUpsertSchedule = Schema.Union([
 ]);
 export type ScheduledTaskUpsertSchedule = typeof ScheduledTaskUpsertSchedule.Type;
 
-const MAX_SCHEDULED_TASK_CHECK_RULES = 16;
+export const MAX_SCHEDULED_TASK_CHECK_RULES = 16;
 export const DEFAULT_SCHEDULED_TASK_CHECK_TIMEOUT_SECONDS = 60;
-const MAX_SCHEDULED_TASK_CHECK_TIMEOUT_SECONDS = 600;
+export const MAX_SCHEDULED_TASK_CHECK_TIMEOUT_SECONDS = 600;
 
 export const ScheduledTaskCheckRule = Schema.Struct({
   exitCode: Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 255 })),

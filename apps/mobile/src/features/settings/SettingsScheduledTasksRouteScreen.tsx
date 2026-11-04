@@ -2,11 +2,12 @@ import * as Dialog from "../../components/ui/Dialog";
 import { useAtomValue } from "@effect/atom-react";
 import {
   AuthOrchestrationOperateScope,
+  AuthTerminalOperateScope,
   clampManagedRuntimeMode,
   managedCapabilityDenial,
   resolveProjectProviderInstanceEnabled,
 } from "@t3tools/contracts";
-import { readEnvironmentScope } from "../../state/session";
+import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
 import type {
   EnvironmentId,
   ProjectId,
@@ -14,6 +15,7 @@ import type {
   ScheduledTaskUpsertInput,
 } from "@t3tools/contracts";
 import {
+  MAX_SCHEDULED_TASK_CHECK_RULES,
   MAX_WEBHOOK_DELIVERY_AGE_MINUTES,
   MAX_WEBHOOK_FILTERS,
   resolveEnvironmentMachineKind,
@@ -35,6 +37,15 @@ import {
   WEBHOOK_FILTER_OPS,
   type WebhookFilterDraft,
 } from "@t3tools/client-runtime/scheduled-task-webhook";
+import {
+  CHECK_TIMEOUT_PLACEHOLDER,
+  checkDraftChanged,
+  checkResultLabel,
+  emptyCheckRuleDraft,
+  parseCheckDraft,
+  removeCheckRuleDraft,
+  type ScheduledTaskCheckDraft,
+} from "@t3tools/client-runtime/scheduled-task-check";
 import { useRef, useState, type ReactNode } from "react";
 import { useFocusEffect, useNavigation, usePreventRemove } from "@react-navigation/native";
 import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
@@ -167,6 +178,7 @@ function FormField(props: {
   readonly disabled?: boolean;
   readonly placeholder?: string;
   readonly borderTop?: boolean;
+  readonly multiline?: boolean;
 }) {
   return (
     <View
@@ -180,7 +192,10 @@ function FormField(props: {
         value={props.value}
         readOnly={props.disabled}
         onChangeText={props.onChange}
-        textAlignVertical="center"
+        multiline={props.multiline}
+        autoCapitalize={props.multiline ? "none" : undefined}
+        autoCorrect={props.multiline ? false : undefined}
+        textAlignVertical={props.multiline ? "top" : "center"}
         keyboardType={props.keyboardType}
         placeholder={props.placeholder}
         placeholderTextColorClassName="accent-foreground-muted"
@@ -332,6 +347,126 @@ function WebhookFilterRows(props: {
         </Text>
       ) : null}
     </>
+  );
+}
+
+function CheckSection(props: {
+  readonly check: ScheduledTaskCheckDraft;
+  readonly canSetCommands: boolean;
+  readonly disabled: boolean;
+  readonly onChange: (check: ScheduledTaskCheckDraft) => void;
+}) {
+  const { check } = props;
+  const disabled = props.disabled || !props.canSetCommands;
+  const updateRule = (index: number, patch: { exitCode?: string; prompt?: string }) =>
+    props.onChange({
+      ...check,
+      rules: check.rules.map((rule, at) => (at === index ? { ...rule, ...patch } : rule)),
+    });
+  return (
+    <SettingsSection title="Check first">
+      <View className="min-h-14 flex-row items-center gap-3 px-4 py-3">
+        <Text textRole="body" className="min-w-0 flex-1 text-foreground">
+          Run a command first
+        </Text>
+        <ThemedSwitch
+          accessibilityLabel="Run a command first"
+          value={check.enabled}
+          disabled={disabled}
+          onValueChange={(enabled) => props.onChange({ ...check, enabled })}
+        />
+      </View>
+      {check.enabled ? (
+        <>
+          <FormField
+            label="Command"
+            value={check.command}
+            placeholder="./scripts/has-work.sh"
+            disabled={disabled}
+            multiline
+            borderTop
+            onChange={(command) => props.onChange({ ...check, command })}
+          />
+          <FormField
+            label="Time limit (seconds)"
+            value={check.timeoutSeconds}
+            placeholder={CHECK_TIMEOUT_PLACEHOLDER}
+            keyboardType="number-pad"
+            disabled={disabled}
+            borderTop
+            onChange={(timeoutSeconds) => props.onChange({ ...check, timeoutSeconds })}
+          />
+          {check.rules.map((rule, index) => (
+            <View key={rule.id}>
+              <View className="flex-row items-center gap-3 border-t border-border-subtle px-4 pt-3">
+                <Text className="min-w-0 flex-1 text-sm text-foreground-muted">
+                  Rule {index + 1}
+                </Text>
+                {check.rules.length > 1 ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={`Remove rule ${index + 1}`}
+                    disabled={disabled}
+                    hitSlop={8}
+                    onPress={() =>
+                      props.onChange({
+                        ...check,
+                        rules: removeCheckRuleDraft(check.rules, rule.id),
+                      })
+                    }
+                    className="active:opacity-70"
+                  >
+                    <SymbolView
+                      name="trash"
+                      size={16}
+                      tintColorClassName="accent-danger-foreground"
+                    />
+                  </Pressable>
+                ) : null}
+              </View>
+              <FormField
+                label="Exit code"
+                value={rule.exitCode}
+                keyboardType="number-pad"
+                disabled={disabled}
+                onChange={(exitCode) => updateRule(index, { exitCode })}
+              />
+              <FormField
+                label="Prompt"
+                value={rule.prompt}
+                placeholder="The task's prompt"
+                disabled={disabled}
+                multiline
+                onChange={(prompt) => updateRule(index, { prompt })}
+              />
+            </View>
+          ))}
+          {check.rules.length < MAX_SCHEDULED_TASK_CHECK_RULES ? (
+            <Pressable
+              accessibilityRole="button"
+              disabled={disabled}
+              onPress={() =>
+                props.onChange({
+                  ...check,
+                  rules: [...check.rules, emptyCheckRuleDraft(check.rules)],
+                })
+              }
+              className="min-h-14 flex-row items-center gap-3 border-t border-border-subtle px-4 py-3 active:opacity-70"
+            >
+              <Text textRole="body" className="min-w-0 flex-1 text-foreground">
+                Add exit code
+              </Text>
+              <SymbolView name="plus" size={16} tintColorClassName="accent-icon" />
+            </Pressable>
+          ) : null}
+        </>
+      ) : null}
+      <Text className="px-4 pb-3 text-sm text-foreground-muted">
+        {props.canSetCommands
+          ? "The command runs in the project folder before each run. Its exit code picks the prompt, and its output is added to it. Any other exit code skips the run."
+          : "Changing the check needs terminal access to this environment."}
+      </Text>
+    </SettingsSection>
   );
 }
 
@@ -702,6 +837,7 @@ function TaskForm({
     label: "scheduled task upsert",
     reportFailure: false,
   });
+  const canSetCommands = useEnvironmentScope(environmentId, AuthTerminalOperateScope);
   const submissionPending = useRef(false);
   const [timePickerOpen, setTimePickerOpen] = useState(false);
   const [runAtPicker, setRunAtPicker] = useState<"date" | "time" | null>(null);
@@ -786,6 +922,19 @@ function TaskForm({
       Dialog.alert("Project unavailable", "Choose a project in this environment.");
       return;
     }
+    // Webhook tasks can't keep a check, so switching to one clears it.
+    const parsedCheck =
+      schedule.type === "webhook"
+        ? draft.savedCheck.enabled
+          ? { check: null }
+          : null
+        : checkDraftChanged(draft.savedCheck, draft.check)
+          ? parseCheckDraft(draft.check)
+          : null;
+    if (parsedCheck !== null && "error" in parsedCheck) {
+      Dialog.alert("Invalid check", parsedCheck.error);
+      return;
+    }
     const input: ScheduledTaskUpsertInput = {
       ...(draft.task ? { id: draft.task.id, requireExisting: true } : {}),
       title: draft.title.trim(),
@@ -809,6 +958,7 @@ function TaskForm({
       runtimeMode:
         clampManagedRuntimeMode(config?.managedPolicy, draft.runtimeMode) ?? draft.runtimeMode,
       interactionMode: draft.task?.interactionMode ?? "default",
+      ...(parsedCheck === null ? {} : { check: parsedCheck.check }),
       creationSource: draft.task?.creationSource ?? "mobile",
     };
     submissionPending.current = true;
@@ -1269,6 +1419,14 @@ function TaskForm({
             Time uses the environment's time zone, which may differ from your phone's.
           </Text>
         ) : null}
+        {draft.schedule.mode === "webhook" ? null : (
+          <CheckSection
+            check={draft.check}
+            canSetCommands={canSetCommands}
+            disabled={saving}
+            onChange={(check) => setDraft({ ...draft, check })}
+          />
+        )}
       </View>
       <Button
         tone="primary"
@@ -1485,6 +1643,18 @@ function EnvironmentTasks({
               {task.lastRunError ? (
                 <Text className="text-sm text-danger-foreground" numberOfLines={2}>
                   Last run failed: {task.lastRunError}
+                </Text>
+              ) : null}
+              {task.check !== undefined && task.lastCheck !== undefined ? (
+                <Text
+                  className={
+                    task.lastCheck.error === null
+                      ? "text-sm text-foreground-muted"
+                      : "text-sm text-danger-foreground"
+                  }
+                  numberOfLines={2}
+                >
+                  {checkResultLabel(task.lastCheck)}
                 </Text>
               ) : null}
             </Pressable>

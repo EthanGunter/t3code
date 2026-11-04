@@ -18,6 +18,10 @@ import {
   type WebhookFilterDraft,
 } from "@t3tools/client-runtime/scheduled-task-webhook";
 import {
+  checkDraft,
+  type ScheduledTaskCheckDraft,
+} from "@t3tools/client-runtime/scheduled-task-check";
+import {
   resolveProjectSettings,
   type LegacyProjectSettingsFields,
 } from "@t3tools/shared/projectSettings";
@@ -210,6 +214,9 @@ export type ScheduledTaskDraft = {
   readonly enabled: boolean;
   readonly startFromOrigin: boolean;
   readonly runtimeMode: RuntimeMode;
+  readonly check: ScheduledTaskCheckDraft;
+  /** The check the form opened with. */
+  readonly savedCheck: ScheduledTaskCheckDraft;
 };
 
 function draftSignature(draft: ScheduledTaskDraft): string {
@@ -238,6 +245,14 @@ function draftSignature(draft: ScheduledTaskDraft): string {
     draft.enabled,
     draft.startFromOrigin,
     draft.runtimeMode,
+    draft.check.enabled,
+    draft.check.enabled
+      ? [
+          draft.check.command,
+          draft.check.timeoutSeconds,
+          draft.check.rules.map(({ exitCode, prompt }) => [exitCode, prompt]),
+        ]
+      : null,
   ]);
 }
 
@@ -266,10 +281,13 @@ export function createDraft(
     enabled: true,
     startFromOrigin: true,
     runtimeMode: "full-access",
+    check: checkDraft(undefined),
+    savedCheck: checkDraft(undefined),
   };
 }
 
 export function editDraft(task: ScheduledTask): ScheduledTaskDraft {
+  const check = checkDraft(task.check);
   return {
     task,
     title: task.title,
@@ -290,5 +308,7 @@ export function editDraft(task: ScheduledTask): ScheduledTaskDraft {
         ? (task.workspaceStrategy.startFromOrigin ?? false)
         : true,
     runtimeMode: task.runtimeMode,
+    check,
+    savedCheck: check,
   };
 }
