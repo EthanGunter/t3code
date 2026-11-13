@@ -75,7 +75,10 @@ const handlers = {
           Effect.mapError(
             (cause) =>
               new OrchestratorMcpFailure({
-                code: cause.reason === "unsupported" ? "invalid_request" : "orchestration_error",
+                code:
+                  cause.reason === "unsupported" || cause.reason === "unmatched"
+                    ? "invalid_request"
+                    : "orchestration_error",
                 message: cause.message,
               }),
           ),
@@ -102,7 +105,16 @@ const handlers = {
       { refused: "schedule tasks in this environment" },
     ),
     McpToolAccess.writes(
-      ({ scheduledTaskId, prompt, title, schedule, enabled, bindToCurrentThread, check }) =>
+      ({
+        scheduledTaskId,
+        prompt,
+        title,
+        schedule,
+        enabled,
+        freshSession,
+        bindToCurrentThread,
+        check,
+      }) =>
         Effect.gen(function* () {
           if (scheduledTaskId === undefined) return yield* Effect.die("unreachable");
           const scope = yield* McpInvocationContext.McpInvocationContext;
@@ -113,6 +125,7 @@ const handlers = {
             title,
             schedule,
             enabled,
+            freshSession,
             bindToCurrentThread,
             check,
           });
